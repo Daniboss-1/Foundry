@@ -38,6 +38,8 @@ exports.deactivate = deactivate;
 const http = __importStar(require("http"));
 const vscode = __importStar(require("vscode"));
 const path = __importStar(require("path"));
+const child_process_1 = require("child_process");
+let lastCommandState = { output: '', exitCode: null };
 function setCORS(res, origin) {
     res.setHeader('Access-Control-Allow-Origin', origin);
     res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
@@ -175,24 +177,52 @@ async function handleInsert(body, origin, res) {
     sendJSON(res, 200, { status: 'ok' }, origin);
 }
 // ── /command ────────────────────────────────────────────────────
+function runCapturedCommand(command, timeoutMs) {
+    return new Promise((resolve) => {
+        const child = (0, child_process_1.exec)(command, { timeout: timeoutMs, maxBuffer: 1024 * 1024 }, (error, stdout, stderr) => {
+            const combined = (stdout + '\n' + stderr).replace(/\n$/, '');
+            if (error) {
+                const code = typeof error.code === 'number' ? error.code : 1;
+                resolve({ output: combined || error.message, exitCode: code });
+            }
+            else {
+                resolve({ output: combined, exitCode: 0 });
+            }
+        });
+    });
+}
 async function handleCommand(body, origin, res) {
     const cmd = body.command;
     if (typeof cmd !== 'string' || cmd.length === 0) {
         sendJSON(res, 400, { error: 'Missing "command" field' }, origin);
         return;
     }
-    let terminal;
-    const existing = vscode.window.terminals;
-    if (existing.length > 0) {
-        terminal = existing[0];
+    const capture = body.capture === true;
+    if (capture) {
+        try {
+            const result = await runCapturedCommand(cmd, 30000);
+            lastCommandState = { output: result.output, exitCode: result.exitCode };
+            sendJSON(res, 200, { status: 'ok', output: result.output, exitCode: result.exitCode }, origin);
+        }
+        catch {
+            lastCommandState = { output: 'Internal error', exitCode: -1 };
+            sendJSON(res, 500, { error: 'Command execution failed' }, origin);
+        }
     }
     else {
-        terminal = vscode.window.createTerminal('FOUNDRY');
+        let terminal;
+        const existing = vscode.window.terminals;
+        if (existing.length > 0) {
+            terminal = existing[0];
+        }
+        else {
+            terminal = vscode.window.createTerminal('FOUNDRY');
+        }
+        terminal.show();
+        terminal.sendText(cmd, true);
+        vscode.window.showInformationMessage('FOUNDRY: Running command');
+        sendJSON(res, 200, { status: 'ok', command: cmd }, origin);
     }
-    terminal.show();
-    terminal.sendText(cmd, true);
-    vscode.window.showInformationMessage('FOUNDRY: Running command');
-    sendJSON(res, 200, { status: 'ok', command: cmd }, origin);
 }
 // ── /open ────────────────────────────────────────────────────────
 async function handleOpen(body, origin, res) {
@@ -223,15 +253,35 @@ async function handleOpen(body, origin, res) {
     await vscode.window.showTextDocument(doc);
     sendJSON(res, 200, { status: 'ok', file: exact[0].fsPath }, origin);
 }
+// ── /status ──────────────────────────────────────────────────────
+function handleStatus(res, origin) {
+    const editor = vscode.window.activeTextEditor;
+    const activeFile = editor ? editor.document.fileName : '';
+    const folders = vscode.workspace.workspaceFolders;
+    const workspaceFolder = folders && folders.length > 0 ? folders[0].uri.fsPath : '';
+    sendJSON(res, 200, {
+        status: 'ok',
+        activeFile,
+        workspaceFolder,
+        lastCommandOutput: lastCommandState.output,
+        lastCommandExitCode: lastCommandState.exitCode,
+    }, origin);
+}
 // ── Server ──────────────────────────────────────────────────────
 function activate(context) {
     const server = http.createServer(async (req, res) => {
         const origin = req.headers.origin ?? '*';
+        const url = req.url;
         // CORS preflight for any URL
         if (req.method === 'OPTIONS') {
             setCORS(res, origin);
             res.writeHead(204);
             res.end();
+            return;
+        }
+        // /status accepts any method (GET, POST, etc.)
+        if (url === '/status') {
+            handleStatus(res, origin);
             return;
         }
         if (req.method !== 'POST') {
@@ -249,7 +299,6 @@ function activate(context) {
             sendJSON(res, 400, { error: 'Invalid JSON' }, origin);
             return;
         }
-        const url = req.url;
         if (url === '/inject') {
             // Replace entire file content (original behavior)
             const code = parsedBody.code;

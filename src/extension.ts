@@ -1,6 +1,14 @@
 import * as http from 'http';
 import * as vscode from 'vscode';
 import * as path from 'path';
+import { exec as execChild } from 'child_process';
+
+interface CommandState {
+  output: string;
+  exitCode: number | null;
+}
+
+let lastCommandState: CommandState = { output: '', exitCode: null };
 
 function setCORS(res: http.ServerResponse, origin: string): void {
   res.setHeader('Access-Control-Allow-Origin', origin);
@@ -159,6 +167,20 @@ async function handleInsert(body: Record<string, unknown>, origin: string, res: 
 
 // ── /command ────────────────────────────────────────────────────
 
+function runCapturedCommand(command: string, timeoutMs: number): Promise<{ output: string; exitCode: number }> {
+  return new Promise<{ output: string; exitCode: number }>((resolve) => {
+    const child = execChild(command, { timeout: timeoutMs, maxBuffer: 1024 * 1024 }, (error, stdout, stderr) => {
+      const combined: string = (stdout + '\n' + stderr).replace(/\n$/, '');
+      if (error) {
+        const code: number = typeof error.code === 'number' ? error.code : 1;
+        resolve({ output: combined || error.message, exitCode: code });
+      } else {
+        resolve({ output: combined, exitCode: 0 });
+      }
+    });
+  });
+}
+
 async function handleCommand(body: Record<string, unknown>, origin: string, res: http.ServerResponse): Promise<void> {
   const cmd = body.command;
   if (typeof cmd !== 'string' || cmd.length === 0) {
@@ -166,19 +188,32 @@ async function handleCommand(body: Record<string, unknown>, origin: string, res:
     return;
   }
 
-  let terminal: vscode.Terminal;
-  const existing = vscode.window.terminals;
-  if (existing.length > 0) {
-    terminal = existing[0];
+  const capture: boolean = body.capture === true;
+
+  if (capture) {
+    try {
+      const result = await runCapturedCommand(cmd, 30000);
+      lastCommandState = { output: result.output, exitCode: result.exitCode };
+      sendJSON(res, 200, { status: 'ok', output: result.output, exitCode: result.exitCode }, origin);
+    } catch {
+      lastCommandState = { output: 'Internal error', exitCode: -1 };
+      sendJSON(res, 500, { error: 'Command execution failed' }, origin);
+    }
   } else {
-    terminal = vscode.window.createTerminal('FOUNDRY');
+    let terminal: vscode.Terminal;
+    const existing = vscode.window.terminals;
+    if (existing.length > 0) {
+      terminal = existing[0];
+    } else {
+      terminal = vscode.window.createTerminal('FOUNDRY');
+    }
+
+    terminal.show();
+    terminal.sendText(cmd, true);
+
+    vscode.window.showInformationMessage('FOUNDRY: Running command');
+    sendJSON(res, 200, { status: 'ok', command: cmd }, origin);
   }
-
-  terminal.show();
-  terminal.sendText(cmd, true);
-
-  vscode.window.showInformationMessage('FOUNDRY: Running command');
-  sendJSON(res, 200, { status: 'ok', command: cmd }, origin);
 }
 
 // ── /open ────────────────────────────────────────────────────────
@@ -216,17 +251,41 @@ async function handleOpen(body: Record<string, unknown>, origin: string, res: ht
   sendJSON(res, 200, { status: 'ok', file: exact[0].fsPath }, origin);
 }
 
+// ── /status ──────────────────────────────────────────────────────
+
+function handleStatus(res: http.ServerResponse, origin: string): void {
+  const editor: vscode.TextEditor | undefined = vscode.window.activeTextEditor;
+  const activeFile: string = editor ? editor.document.fileName : '';
+  const folders: readonly vscode.WorkspaceFolder[] | undefined = vscode.workspace.workspaceFolders;
+  const workspaceFolder: string = folders && folders.length > 0 ? folders[0].uri.fsPath : '';
+
+  sendJSON(res, 200, {
+    status: 'ok',
+    activeFile,
+    workspaceFolder,
+    lastCommandOutput: lastCommandState.output,
+    lastCommandExitCode: lastCommandState.exitCode,
+  }, origin);
+}
+
 // ── Server ──────────────────────────────────────────────────────
 
 export function activate(context: vscode.ExtensionContext): void {
   const server = http.createServer(async (req: http.IncomingMessage, res: http.ServerResponse) => {
     const origin: string = req.headers.origin ?? '*';
+    const url: string | undefined = req.url;
 
     // CORS preflight for any URL
     if (req.method === 'OPTIONS') {
       setCORS(res, origin);
       res.writeHead(204);
       res.end();
+      return;
+    }
+
+    // /status accepts any method (GET, POST, etc.)
+    if (url === '/status') {
+      handleStatus(res, origin);
       return;
     }
 
@@ -245,8 +304,6 @@ export function activate(context: vscode.ExtensionContext): void {
       sendJSON(res, 400, { error: 'Invalid JSON' }, origin);
       return;
     }
-
-    const url: string | undefined = req.url;
 
     if (url === '/inject') {
       // Replace entire file content (original behavior)
