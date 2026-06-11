@@ -125,13 +125,186 @@ function sendRequest(endpoint, body) {
   });
 }
 
+// ── Chat input helpers ──────────────────────────────────────────
+
+function findChatInput() {
+  var selectors = [
+    'textarea[placeholder*="Message DeepSeek"]',
+    'textarea[placeholder*="message"]',
+    'textarea[placeholder*="Type"]',
+    'textarea[placeholder*="Ask"]',
+    'div[id="prompt-textarea"]',
+    'div[contenteditable="true"]',
+    'textarea:not([hidden])',
+  ];
+  for (var _i = 0; _i < selectors.length; _i++) {
+    var el = document.querySelector(selectors[_i]);
+    if (el) return el;
+  }
+  return null;
+}
+
+function findSendButton() {
+  var selectors = [
+    'button[data-testid="send-button"]',
+    'button[aria-label*="Send"]',
+    'button[aria-label*="send"]',
+    'button[class*="send"]',
+    'button[class*="Send"]',
+    'button[class*="submit"]',
+    'button[class*="Submit"]',
+  ];
+  for (var _i = 0; _i < selectors.length; _i++) {
+    var btn = document.querySelector(selectors[_i]);
+    if (btn && btn.offsetParent !== null) return btn;
+  }
+  var form = document.querySelector('form');
+  if (form) {
+    var btns = form.querySelectorAll('button');
+    for (var _b = 0; _b < btns.length; _b++) {
+      if (btns[_b].offsetParent !== null) return btns[_b];
+    }
+  }
+  return null;
+}
+
+function typeIntoAI(message) {
+  var input = findChatInput();
+  if (!input) {
+    showToast('\u2717 Could not find chat input', true);
+    return false;
+  }
+
+  var tag = input.tagName.toLowerCase();
+
+  if (tag === 'textarea') {
+    input.value = message;
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+  } else if (input.isContentEditable) {
+    input.textContent = message;
+    input.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+  } else if (tag === 'input') {
+    input.value = message;
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  } else {
+    showToast('\u2717 Unsupported input type', true);
+    return false;
+  }
+
+  var sendBtn = findSendButton();
+  if (sendBtn) {
+    setTimeout(function () { sendBtn.click(); }, 150);
+    return true;
+  }
+  return true;
+}
+
+// ── Command capture + feedback loop ─────────────────────────────
+
+function formatOutputMessage(command, output, exitCode) {
+  var msg = 'FOUNDRY TERMINAL OUTPUT:\n$ ' + command + '\n';
+  msg += output + '\n';
+  msg += 'Exit code: ' + (exitCode !== null && exitCode !== undefined ? exitCode : '?');
+  msg += '\n\nContinue based on this output.';
+  return msg;
+}
+
+function pollStatusAndSend(command, timeoutMs) {
+  var maxAttempts = Math.ceil(timeoutMs / 2000);
+  var attempts = 0;
+  var seenOutput = '';
+
+  return new Promise(function (resolve, reject) {
+    var interval = setInterval(async function () {
+      attempts++;
+      try {
+        var res = await fetch('http://127.0.0.1:7700/status');
+        if (res.ok) {
+          var data = await res.json();
+          var current = (data.lastCommandOutput || '').trim();
+
+          if (current && current !== seenOutput) {
+            seenOutput = current;
+          }
+
+          if (data.lastCommandExitCode !== null) {
+            clearInterval(interval);
+            var exitCode = data.lastCommandExitCode !== null && data.lastCommandExitCode !== undefined
+              ? data.lastCommandExitCode : -1;
+            var message = formatOutputMessage(command, seenOutput, exitCode);
+            typeIntoAI(message);
+            showToast('\u2713 Output sent to AI', false);
+            resolve();
+            return;
+          }
+        }
+      } catch (_e) {}
+
+      if (attempts >= maxAttempts) {
+        clearInterval(interval);
+        if (seenOutput) {
+          var message = formatOutputMessage(command, seenOutput, null);
+          typeIntoAI(message);
+          showToast('\u2713 Output sent to AI (may be incomplete)', false);
+          resolve();
+        } else {
+          showToast('\u2717 Command timed out', true);
+          reject(new Error('timeout'));
+        }
+      }
+    }, 2000);
+  });
+}
+
+async function handleCommandCapture(code, btn) {
+  showToast('\u26A1 Running command \u2014 waiting for output...', false);
+  btn.textContent = '\u26A1 Running...';
+  btn.style.pointerEvents = 'none';
+
+  var didSubmit = false;
+
+  try {
+    var res = await sendRequest('/command', { command: code, capture: true });
+    if (res.ok) {
+      var data = await res.json();
+      var output = (data.output || '').trim();
+      var exitCode = data.exitCode !== undefined ? data.exitCode : -1;
+
+      if (output) {
+        var message = formatOutputMessage(code, output, exitCode);
+        typeIntoAI(message);
+        showToast('\u2713 Output sent to AI', false);
+        didSubmit = true;
+      } else {
+        await pollStatusAndSend(code, 28000);
+        didSubmit = true;
+      }
+    }
+  } catch (_err) {}
+
+  if (!didSubmit) {
+    try {
+      await pollStatusAndSend(code, 28000);
+    } catch (_e2) {
+      showToast('\u2717 Command failed \u2014 VS Code running?', true);
+    }
+  }
+
+  setTimeout(function () {
+    btn.textContent = '\u26A1 Send to VS Code';
+    btn.style.pointerEvents = 'auto';
+  }, 2500);
+}
+
 // ── Menu ────────────────────────────────────────────────────────
 
 var MENU_ITEMS = [
   { label: 'Replace file', endpoint: '/inject', bodyFn: function (code, filename) { return { code: code, filename: filename }; } },
   { label: 'Insert at end', endpoint: '/insert', bodyFn: function (code, filename) { return { code: code, filename: filename, position: 'end' }; } },
   { label: 'Insert at cursor', endpoint: '/insert', bodyFn: function (code, filename) { return { code: code, filename: filename, position: 'cursor' }; } },
-  { label: 'Run as command', endpoint: '/command', bodyFn: function (code, _f) { return { command: code }; } },
+  { label: 'Run as command', endpoint: '/command', bodyFn: function (code, _f) { return { command: code, capture: true }; } },
   { label: 'Open file', endpoint: '/open', bodyFn: function (_c, filename) { return { filename: filename }; } },
 ];
 
@@ -163,7 +336,7 @@ function showMenu(btn, pre, code, filename) {
     row.addEventListener('mouseleave', function () { this.style.background = ''; });
 
     var icon = document.createElement('span');
-    icon.textContent = isSuggested ? '◆ ' : '  ';
+    icon.textContent = isSuggested ? '\u25C6 ' : '  ';
     row.appendChild(icon);
 
     var textSpan = document.createElement('span');
@@ -174,22 +347,27 @@ function showMenu(btn, pre, code, filename) {
       return async function (e) {
         e.stopPropagation();
         menu.remove();
-        btn.textContent = '⏳ Sending...';
+        btn.textContent = '\u23F3 Sending...';
         btn.style.pointerEvents = 'none';
-        try {
-          var res = await sendRequest(item.endpoint, item.bodyFn(code, filename));
-          if (res.ok) {
-            showToast('\u2713 Sent to VS Code', false);
-          } else {
+
+        if (item.endpoint === '/command') {
+          await handleCommandCapture(code, btn);
+        } else {
+          try {
+            var res = await sendRequest(item.endpoint, item.bodyFn(code, filename));
+            if (res.ok) {
+              showToast('\u2713 Sent to VS Code', false);
+            } else {
+              showToast('\u2717 VS Code not running \u2014 start FOUNDRY', true);
+            }
+          } catch (_err) {
             showToast('\u2717 VS Code not running \u2014 start FOUNDRY', true);
           }
-        } catch (_err) {
-          showToast('\u2717 VS Code not running \u2014 start FOUNDRY', true);
+          setTimeout(function () {
+            btn.textContent = '\u26A1 Send to VS Code';
+            btn.style.pointerEvents = 'auto';
+          }, 2500);
         }
-        setTimeout(function () {
-          btn.textContent = '\u26A1 Send to VS Code';
-          btn.style.pointerEvents = 'auto';
-        }, 2500);
       };
     }(item, code, filename, btn));
 
@@ -203,7 +381,6 @@ function showMenu(btn, pre, code, filename) {
   menu.style.left = menuLeft + 'px';
   document.body.appendChild(menu);
 
-  // Close on click outside
   setTimeout(function () {
     var handler = function (e) {
       if (!menu.contains(e.target) && e.target !== btn) {
