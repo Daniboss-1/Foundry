@@ -1,3 +1,7 @@
+document.documentElement.dataset.foundrySkillsLoaded = 'true';
+document.documentElement.dataset.foundryInterceptorAttached = document.querySelector('textarea[placeholder*="Message DeepSeek"]') ? 'true' : 'false';
+setupTextareaInterceptor();
+
 var EXT_MAP = {
   javascript: 'js', typescript: 'ts', python: 'py', rust: 'rs',
   go: 'go', java: 'java', cpp: 'cpp', 'c++': 'cpp', c: 'c',
@@ -153,6 +157,7 @@ function findChatInput() {
 function findSendButton() {
   var selectors = [
     'button[data-testid="send-button"]',
+    'button[aria-label="Send message"]',
     'button[aria-label*="Send"]',
     'button[aria-label*="send"]',
     'button[class*="send"]',
@@ -188,8 +193,17 @@ function typeIntoAI(message) {
     input.dispatchEvent(new Event('input', { bubbles: true }));
     input.dispatchEvent(new Event('change', { bubbles: true }));
   } else if (input.isContentEditable) {
-    input.textContent = message;
-    input.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true }));
+    input.focus();
+    var sel = window.getSelection();
+    if (sel) {
+      sel.removeAllRanges();
+      var range = document.createRange();
+      range.selectNodeContents(input);
+      sel.addRange(range);
+    }
+    document.execCommand('delete', false, null);
+    document.execCommand('insertText', false, message);
+    input.dispatchEvent(new Event('input', { bubbles: true }));
     input.dispatchEvent(new Event('change', { bubbles: true }));
   } else if (tag === 'input') {
     input.value = message;
@@ -527,7 +541,7 @@ function extractSearchQuery(prompt, trigger) {
 var SKILL_DEFS = [
   {
     name: 'Current File',
-    triggers: [/\b(my file|current code|this function|my code|fix this)\b/i],
+    triggers: [/\b(my file|current file|current code|this function|my code|fix this|fix|bug)\b/i],
     execute: async function () {
       try {
         var statusRes = await fetch('http://127.0.0.1:7700/status');
@@ -781,14 +795,70 @@ function setupSkillInterceptor() {
   }
 }
 
+// ── Textarea Enter key interceptor ────────────────────────────
+
+function setupTextareaInterceptor() {
+  var ta = document.querySelector('textarea[placeholder*="Message DeepSeek"]');
+  if (!ta) return;
+  if (ta._foundryTextareaAttached) return;
+  ta._foundryTextareaAttached = true;
+
+  ta.addEventListener('keydown', function (e) {
+    if (e.key !== 'Enter' || e.shiftKey) return;
+
+    if (_skillGuard) { _skillGuard = false; return; }
+
+    var prompt = ta.value;
+    console.log('FOUNDRY: keydown detected');
+    console.log('FOUNDRY: prompt text =', prompt);
+
+    if (!prompt || !prompt.trim()) return;
+
+    var skills = detectSkills(prompt);
+    console.log('FOUNDRY: skills matched =', skills.map(function (s) { return s.name; }));
+
+    if (skills.length === 0) return;
+
+    e.preventDefault();
+    e.stopPropagation();
+
+    console.log('FOUNDRY: fetching context...');
+    showBanner(skills.map(function (s) { return s.name; }));
+
+    executeSkills(skills, prompt).then(function (injection) {
+      if (injection) {
+        console.log('FOUNDRY: injecting into prompt');
+        ta.value = prompt + '\n\n' + injection;
+        ta.dispatchEvent(new Event('input', { bubbles: true }));
+        ta.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+      _skillGuard = true;
+      setTimeout(function () {
+        var sendBtn = findSendButton();
+        if (sendBtn) sendBtn.click();
+      }, 100);
+    }, function () {
+      _skillGuard = true;
+      setTimeout(function () {
+        var sendBtn = findSendButton();
+        if (sendBtn) sendBtn.click();
+      }, 100);
+    });
+  }, true); // capture phase
+
+  document.documentElement.dataset.foundryInterceptorAttached = 'true';
+}
+
 // ── Integrate with existing MutationObserver ───────────────────
 
 observer.disconnect();
 observer = new MutationObserver(function () {
   addButtons();
   setupSkillInterceptor();
+  setupTextareaInterceptor();
 });
 observer.observe(document.body, { childList: true, subtree: true });
 
 // Also run immediately
 setupSkillInterceptor();
+setupTextareaInterceptor();
