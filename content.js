@@ -40,6 +40,12 @@ function getFilename(pre) {
   return 'code.txt';
 }
 
+function stripFoundryUI(text) {
+  var idx = text.indexOf('\u26A1');
+  if (idx !== -1) text = text.substring(0, idx);
+  return text.replace(/Send to VS Code/g, '').trim();
+}
+
 // ── Intent detection ────────────────────────────────────────────
 
 function getSurroundingText(pre) {
@@ -266,7 +272,8 @@ async function handleCommandCapture(code, btn) {
   var didSubmit = false;
 
   try {
-    var res = await sendRequest('/command', { command: code, capture: true });
+    var cleanCode = stripFoundryUI(code);
+    var res = await sendRequest("/command", { command: cleanCode, capture: true });
     if (res.ok) {
       var data = await res.json();
       var output = (data.output || '').trim();
@@ -419,7 +426,7 @@ function addButtons() {
         e.stopPropagation();
         var existing = document.querySelector('.foundry-menu');
         if (existing) { existing.remove(); return; }
-        var code = (pre.querySelector('code') ? pre.querySelector('code').textContent : pre.textContent || '').trim();
+        var code = stripFoundryUI(pre.querySelector('code') ? pre.querySelector('code').textContent : pre.textContent || '');
         var filename = getFilename(pre);
         showMenu(btn, pre, code, filename);
       });
@@ -433,3 +440,10 @@ addButtons();
 
 var observer = new MutationObserver(function () { addButtons(); });
 observer.observe(document.body, { childList: true, subtree: true });
+
+// Patch: clean FOUNDRY UI text from extracted code
+var _origExtract = extractCode;
+function extractCode(pre) {
+  var result = _origExtract(pre);
+  return result.replace(/⚡[^\n]*/gm, '').replace(/Send to VS Code[^\n]*/gm, '').trim();
+}
