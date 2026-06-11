@@ -1,0 +1,25 @@
+{
+  "manifest_version": 3,
+  "name": "FOUNDRY",
+  "version": "1.0",
+  "description": "Send code blocks from AI chat sites to VS Code",
+  "permissions": ["scripting"],
+  "host_permissions": [
+    "http://127.0.0.1/*",
+    "https://web.kimi.ai/*",
+    "https://chat.deepseek.com/*",
+    "https://claude.ai/*",
+    "https://chatgpt.com/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://web.kimi.ai/*",
+        "https://chat.deepseek.com/*",
+        "https://claude.ai/*",
+        "https://chatgpt.com/*"
+      ],
+      "js": ["content.js"]
+    }
+  ]
+}
