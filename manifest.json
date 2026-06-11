@@ -9,7 +9,8 @@
     "https://web.kimi.ai/*",
     "https://chat.deepseek.com/*",
     "https://claude.ai/*",
-    "https://chatgpt.com/*"
+    "https://chatgpt.com/*",
+    "https://duckduckgo.com/*"
   ],
   "content_scripts": [
     {

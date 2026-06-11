@@ -441,9 +441,354 @@ addButtons();
 var observer = new MutationObserver(function () { addButtons(); });
 observer.observe(document.body, { childList: true, subtree: true });
 
-// Patch: clean FOUNDRY UI text from extracted code
-var _origExtract = extractCode;
-function extractCode(pre) {
-  var result = _origExtract(pre);
-  return result.replace(/⚡[^\n]*/gm, '').replace(/Send to VS Code[^\n]*/gm, '').trim();
+// ═══════════════════════════════════════════════════════════════════
+// ── SKILL INJECTOR SYSTEM ─────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════
+
+// ── Prompt Helpers ─────────────────────────────────────────────
+
+function readPrompt() {
+  var input = findChatInput();
+  if (!input) return '';
+  var tag = input.tagName.toLowerCase();
+  if (tag === 'textarea') return input.value;
+  if (input.isContentEditable) return input.textContent || '';
+  if (tag === 'input') return input.value;
+  return '';
 }
+
+function writePrompt(text) {
+  var input = findChatInput();
+  if (!input) return;
+  var tag = input.tagName.toLowerCase();
+  if (tag === 'textarea') {
+    input.value = text;
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+  } else if (input.isContentEditable) {
+    input.textContent = text;
+    input.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+  } else if (tag === 'input') {
+    input.value = text;
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  }
+}
+
+// ── DuckDuckGo result parser ─────────────────────────────────
+
+function parseDuckDuckGoResults(html) {
+  var results = [];
+  var parser = new DOMParser();
+  var doc = parser.parseFromString(html, 'text/html');
+  var snippets = doc.querySelectorAll('.result__snippet, .result__body');
+  var count = 0;
+  for (var _i = 0; _i < snippets.length && count < 3; _i++) {
+    var text = (snippets[_i].textContent || '').trim();
+    if (text) {
+      results.push(text);
+      count++;
+    }
+  }
+  // Fallback: extract text between <a class="result__a"> tags
+  if (results.length === 0) {
+    var links = doc.querySelectorAll('.result__a');
+    for (var _b = 0; _b < links.length && results.length < 3; _b++) {
+      var t = (links[_b].textContent || '').trim();
+      if (t) results.push(t);
+    }
+  }
+  // Last fallback: grab any visible text block
+  if (results.length === 0) {
+    var body = doc.body;
+    if (body) {
+      var texts = body.textContent || '';
+      var lines = texts.split('\n').filter(function (l) { return l.trim().length > 40; });
+      for (var _c = 0; _c < lines.length && results.length < 3; _c++) {
+        results.push(lines[_c].trim().substring(0, 200));
+      }
+    }
+  }
+  return results;
+}
+
+function extractSearchQuery(prompt, trigger) {
+  var idx = prompt.toLowerCase().indexOf(trigger);
+  if (idx !== -1) {
+    var after = prompt.substring(idx + trigger.length).trim();
+    if (after.length > 3) return after.substring(0, 100);
+  }
+  // fallback: use last 100 chars of prompt
+  return prompt.substring(0, 100).trim();
+}
+
+// ── Skill Definitions ──────────────────────────────────────────
+
+var SKILL_DEFS = [
+  {
+    name: 'Current File',
+    triggers: [/\b(my file|current code|this function|my code|fix this)\b/i],
+    execute: async function () {
+      try {
+        var statusRes = await fetch('http://127.0.0.1:7700/status');
+        if (!statusRes.ok) return null;
+        var status = await statusRes.json();
+        var activeFile = status.activeFile || '';
+        if (!activeFile) return null;
+        var fileRes = await fetch('http://127.0.0.1:7700/file?path=' + encodeURIComponent(activeFile));
+        if (!fileRes.ok) return null;
+        var fileData = await fileRes.json();
+        var content = fileData.content || '';
+        var filename = activeFile.split('/').pop() || activeFile.split('\\').pop() || 'file';
+        return '\n\nCURRENT FILE [' + filename + ']:\n```\n' + content + '\n```';
+      } catch (_e) { return null; }
+    },
+  },
+  {
+    name: 'TypeScript Errors',
+    triggers: [/\b(fix errors|fix bugs|not working|broken|failing)\b/i],
+    execute: async function () {
+      try {
+        var statusRes = await fetch('http://127.0.0.1:7700/status');
+        if (!statusRes.ok) return null;
+        var status = await statusRes.json();
+        var ws = status.workspaceFolder || '';
+        if (!ws) return null;
+        var cmdRes = await fetch('http://127.0.0.1:7700/command', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ command: 'cd ' + JSON.stringify(ws) + ' && npx tsc --noEmit 2>&1', capture: true }),
+        });
+        if (!cmdRes.ok) return null;
+        var cmdData = await cmdRes.json();
+        var output = cmdData.output || 'No errors';
+        return '\n\nTYPESCRIPT ERRORS:\n' + output;
+      } catch (_e) { return null; }
+    },
+  },
+  {
+    name: 'Web Search',
+    triggers: [/\b(latest|how to|what is|docs for|documentation|current version)\b/i],
+    execute: async function (prompt) {
+      var query = extractSearchQuery(prompt, matchTrigger(prompt, this.triggers));
+      if (!query) return null;
+      try {
+        var res = await fetch('https://duckduckgo.com/html/?q=' + encodeURIComponent(query));
+        if (!res.ok) return null;
+        var html = await res.text();
+        var results = parseDuckDuckGoResults(html);
+        if (results.length === 0) return null;
+        return '\n\nWEB SEARCH RESULTS:\n' + results.join('\n---\n');
+      } catch (_e) { return null; }
+    },
+  },
+  {
+    name: 'Git Changes',
+    triggers: [/\b(what changed|recent changes|git|last commit|diff)\b/i],
+    execute: async function () {
+      try {
+        var statusRes = await fetch('http://127.0.0.1:7700/status');
+        if (!statusRes.ok) return null;
+        var status = await statusRes.json();
+        var ws = status.workspaceFolder || '';
+        if (!ws) return null;
+        var cmdRes = await fetch('http://127.0.0.1:7700/command', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ command: 'cd ' + JSON.stringify(ws) + ' && git diff HEAD~1 2>&1', capture: true }),
+        });
+        if (!cmdRes.ok) return null;
+        var cmdData = await cmdRes.json();
+        var output = cmdData.output || 'No changes';
+        return '\n\nRECENT GIT CHANGES:\n' + output;
+      } catch (_e) { return null; }
+    },
+  },
+  {
+    name: 'Project Context',
+    triggers: [/\b(my project|whole codebase|all files|project structure)\b/i],
+    execute: async function () {
+      try {
+        var statusRes = await fetch('http://127.0.0.1:7700/status');
+        if (!statusRes.ok) return null;
+        var status = await statusRes.json();
+        var ws = status.workspaceFolder || '';
+        if (!ws) return null;
+        var treeRes = await fetch('http://127.0.0.1:7700/command', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ command: 'cd ' + JSON.stringify(ws) + ' && find . -name "*.ts" -not -path "*/node_modules/*" 2>&1', capture: true }),
+        });
+        if (!treeRes.ok) return null;
+        var treeData = await treeRes.json();
+        var tree = (treeData.output || '').trim();
+        if (!tree) return null;
+
+        var files = tree.split('\n').filter(function (f) { return f.trim(); });
+        var contents = '';
+        var readCount = 0;
+        for (var _i = 0; _i < files.length && readCount < 5; _i++) {
+          var f = files[_i].trim();
+          if (!f) continue;
+          try {
+            var fileRes = await fetch('http://127.0.0.1:7700/file?path=' + encodeURIComponent(f));
+            if (fileRes.ok) {
+              var fd = await fileRes.json();
+              contents += '\n--- ' + f + ' ---\n' + (fd.content || '') + '\n';
+              readCount++;
+            }
+          } catch (_e) {}
+        }
+        return '\n\nPROJECT STRUCTURE:\n' + tree + '\n\nFILES:\n' + contents;
+      } catch (_e) { return null; }
+    },
+  },
+];
+
+function matchTrigger(prompt, triggers) {
+  for (var _i = 0; _i < triggers.length; _i++) {
+    var m = prompt.match(triggers[_i]);
+    if (m) return m[0];
+  }
+  return '';
+}
+
+// ── Skill Detection ────────────────────────────────────────────
+
+function detectSkills(prompt) {
+  var matched = [];
+  for (var _i = 0; _i < SKILL_DEFS.length; _i++) {
+    var skill = SKILL_DEFS[_i];
+    for (var _b = 0; _b < skill.triggers.length; _b++) {
+      if (skill.triggers[_b].test(prompt)) {
+        matched.push(skill);
+        break;
+      }
+    }
+  }
+  return matched;
+}
+
+// ── Skill Execution ────────────────────────────────────────────
+
+async function executeSkills(skills, prompt) {
+  var results = await Promise.all(skills.map(function (s) {
+    try { return s.execute(prompt); }
+    catch (_e) { return null; }
+  }));
+  return results.filter(function (r) { return r; }).join('\n\n');
+}
+
+// ── Skill Banner ───────────────────────────────────────────────
+
+var _bannerEl = null;
+
+function showBanner(names) {
+  hideBanner();
+  var banner = document.createElement('div');
+  _bannerEl = banner;
+  banner.className = 'foundry-skill-banner';
+  banner.textContent = '\u26A1 FOUNDRY injecting: ' + names.join(', ');
+  banner.style.cssText =
+    'position:fixed;bottom:80px;right:24px;z-index:999998;' +
+    'padding:10px 18px;border-radius:8px;font-size:13px;' +
+    'font-family:-apple-system,BlinkMacSystemFont,sans-serif;' +
+    'color:#fff;background:#0078d4;' +
+    'box-shadow:0 4px 16px rgba(0,0,0,0.2);' +
+    'transform:translateY(20px);opacity:0;' +
+    'transition:all 0.3s ease;pointer-events:none;' +
+    'max-width:320px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;';
+  document.body.appendChild(banner);
+  requestAnimationFrame(function () {
+    banner.style.transform = 'translateY(0)';
+    banner.style.opacity = '1';
+  });
+  // auto-hide after 5s
+  setTimeout(hideBanner, 5000);
+}
+
+function hideBanner() {
+  if (_bannerEl) {
+    _bannerEl.style.transform = 'translateY(20px)';
+    _bannerEl.style.opacity = '0';
+    var el = _bannerEl;
+    setTimeout(function () { if (el.parentNode) el.remove(); }, 300);
+    _bannerEl = null;
+  }
+}
+
+// ── Send Interception ──────────────────────────────────────────
+
+var _skillGuard = false;
+
+function setupSkillInterceptor() {
+  // Find existing buttons and attach if not already done
+  var btns = document.querySelectorAll('button');
+  for (var _i = 0; _i < btns.length; _i++) {
+    var btn = btns[_i];
+    if (btn._foundrySkillAttached) continue;
+    if (!btn.offsetParent) continue; // hidden
+
+    var isSendBtn = false;
+    var attr = (btn.getAttribute('data-testid') || '').toLowerCase();
+    var label = (btn.getAttribute('aria-label') || '').toLowerCase();
+    var cls = (btn.className || '').toLowerCase();
+    if (attr === 'send-button') isSendBtn = true;
+    if (label.indexOf('send') !== -1) isSendBtn = true;
+    if (cls.indexOf('send') !== -1) isSendBtn = true;
+    // For sites where the last visible button in form is the send
+    if (!isSendBtn) {
+      var form = btn.closest('form');
+      if (form) {
+        var visibleBtns = form.querySelectorAll('button');
+        if (visibleBtns.length > 0 && visibleBtns[visibleBtns.length - 1] === btn) {
+          // Check if there's a chat input nearby
+          var input = findChatInput();
+          if (input && form.contains(input)) isSendBtn = true;
+        }
+      }
+    }
+
+    if (!isSendBtn) continue;
+
+    btn._foundrySkillAttached = true;
+
+    btn.addEventListener('click', function (e) {
+      if (_skillGuard) { _skillGuard = false; return; }
+
+      var prompt = readPrompt();
+      if (!prompt || !prompt.trim()) return;
+
+      var skills = detectSkills(prompt);
+      if (skills.length === 0) return;
+
+      e.stopPropagation();
+      e.preventDefault();
+
+      showBanner(skills.map(function (s) { return s.name; }));
+
+      executeSkills(skills, prompt).then(function (injection) {
+        if (injection) {
+          writePrompt(prompt + '\n\n' + injection);
+        }
+        _skillGuard = true;
+        setTimeout(function () { btn.click(); }, 150);
+      }, function () {
+        _skillGuard = true;
+        setTimeout(function () { btn.click(); }, 150);
+      });
+    }, true); // capture phase
+  }
+}
+
+// ── Integrate with existing MutationObserver ───────────────────
+
+observer.disconnect();
+observer = new MutationObserver(function () {
+  addButtons();
+  setupSkillInterceptor();
+});
+observer.observe(document.body, { childList: true, subtree: true });
+
+// Also run immediately
+setupSkillInterceptor();
