@@ -36,6 +36,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.activate = activate;
 exports.deactivate = deactivate;
 const http = __importStar(require("http"));
+const fs = __importStar(require("fs"));
 const vscode = __importStar(require("vscode"));
 const path = __importStar(require("path"));
 const child_process_1 = require("child_process");
@@ -267,6 +268,39 @@ function handleStatus(res, origin) {
         lastCommandExitCode: lastCommandState.exitCode,
     }, origin);
 }
+// ── /file ────────────────────────────────────────────────────────
+function handleFile(req, res, origin) {
+    if (req.method !== 'GET') {
+        setCORS(res, origin);
+        res.writeHead(405);
+        res.end(JSON.stringify({ error: 'Method not allowed' }));
+        return;
+    }
+    const folders = vscode.workspace.workspaceFolders;
+    if (!folders || folders.length === 0) {
+        sendJSON(res, 400, { error: 'No workspace folder open' }, origin);
+        return;
+    }
+    const workspacePath = folders[0].uri.fsPath;
+    const parsedUrl = new URL(req.url, 'http://localhost');
+    const filePath = parsedUrl.searchParams.get('path');
+    if (!filePath) {
+        sendJSON(res, 400, { error: 'Missing "path" query param' }, origin);
+        return;
+    }
+    const resolvedPath = path.resolve(workspacePath, filePath);
+    if (!resolvedPath.startsWith(workspacePath)) {
+        sendJSON(res, 403, { error: 'Path outside workspace' }, origin);
+        return;
+    }
+    try {
+        const content = fs.readFileSync(resolvedPath, 'utf-8');
+        sendJSON(res, 200, { status: 'ok', content }, origin);
+    }
+    catch {
+        sendJSON(res, 404, { error: 'File not found or unreadable' }, origin);
+    }
+}
 // ── Server ──────────────────────────────────────────────────────
 function activate(context) {
     const server = http.createServer(async (req, res) => {
@@ -279,9 +313,14 @@ function activate(context) {
             res.end();
             return;
         }
-        // /status accepts any method (GET, POST, etc.)
+        // /status accepts any method
         if (url === '/status') {
             handleStatus(res, origin);
+            return;
+        }
+        // /file accepts GET (with query param ?path=...)
+        if (url && (url === '/file' || url.startsWith('/file?'))) {
+            handleFile(req, res, origin);
             return;
         }
         if (req.method !== 'POST') {

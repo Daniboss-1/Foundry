@@ -1,4 +1,5 @@
 import * as http from 'http';
+import * as fs from 'fs';
 import * as vscode from 'vscode';
 import * as path from 'path';
 import { exec as execChild } from 'child_process';
@@ -268,6 +269,46 @@ function handleStatus(res: http.ServerResponse, origin: string): void {
   }, origin);
 }
 
+// ── /file ────────────────────────────────────────────────────────
+
+function handleFile(req: http.IncomingMessage, res: http.ServerResponse, origin: string): void {
+  if (req.method !== 'GET') {
+    setCORS(res, origin);
+    res.writeHead(405);
+    res.end(JSON.stringify({ error: 'Method not allowed' }));
+    return;
+  }
+
+  const folders = vscode.workspace.workspaceFolders;
+  if (!folders || folders.length === 0) {
+    sendJSON(res, 400, { error: 'No workspace folder open' }, origin);
+    return;
+  }
+
+  const workspacePath: string = folders[0].uri.fsPath;
+  const parsedUrl: URL = new URL(req.url!, 'http://localhost');
+  const filePath: string | null = parsedUrl.searchParams.get('path');
+
+  if (!filePath) {
+    sendJSON(res, 400, { error: 'Missing "path" query param' }, origin);
+    return;
+  }
+
+  const resolvedPath: string = path.resolve(workspacePath, filePath);
+
+  if (!resolvedPath.startsWith(workspacePath)) {
+    sendJSON(res, 403, { error: 'Path outside workspace' }, origin);
+    return;
+  }
+
+  try {
+    const content: string = fs.readFileSync(resolvedPath, 'utf-8');
+    sendJSON(res, 200, { status: 'ok', content }, origin);
+  } catch {
+    sendJSON(res, 404, { error: 'File not found or unreadable' }, origin);
+  }
+}
+
 // ── Server ──────────────────────────────────────────────────────
 
 export function activate(context: vscode.ExtensionContext): void {
@@ -283,9 +324,15 @@ export function activate(context: vscode.ExtensionContext): void {
       return;
     }
 
-    // /status accepts any method (GET, POST, etc.)
+    // /status accepts any method
     if (url === '/status') {
       handleStatus(res, origin);
+      return;
+    }
+
+    // /file accepts GET (with query param ?path=...)
+    if (url && (url === '/file' || url.startsWith('/file?'))) {
+      handleFile(req, res, origin);
       return;
     }
 
