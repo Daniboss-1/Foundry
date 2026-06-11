@@ -276,26 +276,27 @@ function handleFile(req, res, origin) {
         res.end(JSON.stringify({ error: 'Method not allowed' }));
         return;
     }
-    const folders = vscode.workspace.workspaceFolders;
-    if (!folders || folders.length === 0) {
-        sendJSON(res, 400, { error: 'No workspace folder open' }, origin);
-        return;
-    }
-    const workspacePath = folders[0].uri.fsPath;
     const parsedUrl = new URL(req.url, 'http://localhost');
     const filePath = parsedUrl.searchParams.get('path');
     if (!filePath) {
         sendJSON(res, 400, { error: 'Missing "path" query param' }, origin);
         return;
     }
-    const resolvedPath = path.resolve(workspacePath, filePath);
-    if (!resolvedPath.startsWith(workspacePath)) {
-        sendJSON(res, 403, { error: 'Path outside workspace' }, origin);
+    if (!path.isAbsolute(filePath)) {
+        sendJSON(res, 400, { error: 'Path must be absolute' }, origin);
+        return;
+    }
+    if (filePath.indexOf('..') !== -1) {
+        sendJSON(res, 403, { error: 'Path traversal denied' }, origin);
+        return;
+    }
+    if (!fs.existsSync(filePath)) {
+        sendJSON(res, 404, { error: 'File not found' }, origin);
         return;
     }
     try {
-        const content = fs.readFileSync(resolvedPath, 'utf-8');
-        sendJSON(res, 200, { status: 'ok', content }, origin);
+        const content = fs.readFileSync(filePath, 'utf-8');
+        sendJSON(res, 200, { status: 'ok', content, path: filePath }, origin);
     }
     catch {
         sendJSON(res, 404, { error: 'File not found or unreadable' }, origin);
